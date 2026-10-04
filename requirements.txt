@@ -1,8 +1,0 @@
-httpx
-python-dotenv
-pydantic
-pytest
-pytest-asyncio
-anyio[trio]
-fastapi
-uvicorn
