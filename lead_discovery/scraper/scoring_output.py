@@ -1,12 +1,113 @@
-"""Deterministic, evidence-backed lead scoring for the existing lead schema."""
+"""Validated lead export schema and deterministic business lead scoring."""
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 from typing import Any
 from urllib.parse import urlparse
 
+class StrictOutputModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+class BusinessSection(StrictOutputModel):
+    name: str
+    category: str | None = None
+    sub_category: str | None = None
+    description: str | None = None
+    address: str | None = None
+    phone: str | None = None
+    email: str | None = None
+    website: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    rating: float | None = None
+
+class HoursEntry(StrictOutputModel):
+    opens: str | None = None
+    closes: str | None = None
+    closed: bool = False
+
+class ProfileSection(StrictOutputModel):
+    services: list[str] = Field(default_factory=list)
+    products: list[str] = Field(default_factory=list)
+    target_customers: list[str] = Field(default_factory=list)
+    about_info: str = ""
+    operating_hours: dict[str, HoursEntry] = Field(default_factory=dict)
+
+class WebsiteSection(StrictOutputModel):
+    status: str = "not_checked"
+    about: str | None = None
+    services: list[str] = Field(default_factory=list)
+    contact_page_url: str | None = None
+    technology_stack: list[str] = Field(default_factory=list)
+
+class ContactsSection(StrictOutputModel):
+    contact_person: str | None = None
+    emails: list[str] = Field(default_factory=list)
+    phone_numbers: list[str] = Field(default_factory=list)
+
+class SocialLinksSection(StrictOutputModel):
+    facebook: HttpUrl | None = None
+    instagram: HttpUrl | None = None
+    linkedin: HttpUrl | None = None
+
+class ScoringSection(StrictOutputModel):
+    lead_score: float | None = None
+    priority: str = "Unknown"
+    qualification_status: str = "Unknown"
+
+class LeadOutput(StrictOutputModel):
+    lead_id: str
+    business: BusinessSection
+    profile: ProfileSection
+    website_analysis: WebsiteSection
+    contacts: ContactsSection
+    social_links: SocialLinksSection
+    lead_scoring: ScoringSection
+
+def compact_scoring_evidence(value: Any) -> None:
+    """Trim and deduplicate score evidence before it reaches the lead export."""
+    if isinstance(value, dict):
+        for name, child in list(value.items()):
+            if name == "evidence_used" and isinstance(child, list):
+                compact: list[dict[str, Any]] = []
+                seen: set[tuple[str, str]] = set()
+                for item in child:
+                    if not isinstance(item, dict):
+                        continue
+                    raw_text = item.get("snippet") or item.get("value")
+                    text = re.sub(r"\s+", " ", str(raw_text or "")).strip()
+                    if len(text) > 200:
+                        text = text[:197].rstrip() + "..."
+                    sources = item.get("source_urls")
+                    source_url = item.get("source_url")
+                    if not source_url and isinstance(sources, list):
+                        source_url = next((url for url in sources if isinstance(url, str)), None)
+                    source_url = source_url if isinstance(source_url, str) else None
+                    signature = (text, source_url or "")
+                    if not text or signature in seen:
+                        continue
+                    seen.add(signature)
+                    compact.append({"value": text, "source_url": source_url, "snippet": text})
+                value[name] = compact
+            else:
+                compact_scoring_evidence(child)
+    elif isinstance(value, list):
+        for item in value:
+            compact_scoring_evidence(item)
+
+
+def remove_scoring_evidence(value: Any) -> None:
+    """Remove verbose evidence payloads from exported score breakdowns in place."""
+    if isinstance(value, dict):
+        value.pop("evidence_used", None)
+        for child in value.values():
+            remove_scoring_evidence(child)
+    elif isinstance(value, list):
+        for item in value:
+            remove_scoring_evidence(item)
 
 DIMENSIONS = {
     "business_relevance": 20,
@@ -16,7 +117,6 @@ DIMENSIONS = {
     "contact_accessibility": 15,
     "business_maturity": 15,
 }
-
 
 @dataclass(frozen=True)
 class ScoringConfig:
@@ -42,15 +142,12 @@ class ScoringConfig:
         if not 0 <= self.needs_review_minimum <= self.medium_priority_minimum <= self.high_priority_minimum <= 100:
             raise ValueError("score thresholds must satisfy 0 <= review <= medium <= high <= 100")
 
-
 def _dump(value: Any) -> Any:
     return value.model_dump(mode="python") if hasattr(value, "model_dump") else value
-
 
 def _mapping(value: Any) -> dict[str, Any]:
     value = _dump(value)
     return value if isinstance(value, dict) else {}
-
 
 def _text(value: Any) -> str | None:
     value = _dump(value)
@@ -62,7 +159,6 @@ def _text(value: Any) -> str | None:
                 return _text(value[key])
     return None
 
-
 def _sources(metadata: dict[str, Any], key: str, item: Any = None) -> list[str]:
     item = _mapping(item)
     direct = item.get("source_urls") or ([item["source_url"]] if item.get("source_url") else [])
@@ -71,7 +167,6 @@ def _sources(metadata: dict[str, Any], key: str, item: Any = None) -> list[str]:
     source_map = _mapping(metadata.get("field_sources"))
     urls = source_map.get(key) or []
     return list(dict.fromkeys(str(url) for url in urls if url)) if isinstance(urls, list) else []
-
 
 def _fact_records(value: Any, metadata: dict[str, Any], source_key: str) -> list[dict[str, Any]]:
     value = _dump(value)
@@ -91,16 +186,13 @@ def _fact_records(value: Any, metadata: dict[str, Any], source_key: str) -> list
         output.append({"value": text, "source_urls": _sources(metadata, source_key, item)})
     return output
 
-
 def _module_status(metadata: dict[str, Any], module: str) -> str:
     statuses = _mapping(metadata.get("module_status"))
     status = statuses.get(module, "")
     return str(getattr(status, "value", status)).casefold()
 
-
 def _checked(metadata: dict[str, Any], module: str) -> bool:
     return _module_status(metadata, module) in {"success", "partial", "not_available"}
-
 
 def _url_is_http(value: Any) -> bool:
     if not isinstance(value, str):
@@ -111,20 +203,17 @@ def _url_is_http(value: Any) -> bool:
     except ValueError:
         return False
 
-
 def _valid_phone(value: Any) -> bool:
     if not isinstance(value, str):
         return False
     digits = re.sub(r"\D", "", value)
     return 7 <= len(digits) <= 15 and len(set(digits)) > 1
 
-
 def _valid_email(value: Any) -> bool:
     if not isinstance(value, str):
         return False
     value = value.strip()
     return bool(re.fullmatch(r"[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+", value, re.I))
-
 
 def _factor(maximum: float, assessable: bool, earned: float = 0, evidence: list[dict[str, Any]] | None = None,
             missing: str | None = None) -> dict[str, Any]:
@@ -137,7 +226,6 @@ def _factor(maximum: float, assessable: bool, earned: float = 0, evidence: list[
         "evidence_used": evidence,
         "missing_or_unavailable": [] if assessable else [missing or "No verified evidence available"],
     }
-
 
 def _combine_facts(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
@@ -155,7 +243,6 @@ def _combine_facts(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 output.append(copy)
     return output
 
-
 def classify_score(score: float | None, evidence_coverage: float, config: ScoringConfig | None = None) -> tuple[str, str]:
     """Apply the shared configurable priority and qualification bands."""
     config = config or ScoringConfig()
@@ -171,7 +258,6 @@ def classify_score(score: float | None, evidence_coverage: float, config: Scorin
         "Needs Review" if score >= config.needs_review_minimum else "Not Qualified"
     )
     return priority, qualification
-
 
 def score_lead(lead: Any, config: ScoringConfig | None = None) -> dict[str, Any]:
     """Score one existing enriched lead object; never fetches or invents evidence."""

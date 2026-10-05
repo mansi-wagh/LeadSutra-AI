@@ -1,7 +1,7 @@
 from copy import deepcopy
 from datetime import date
 
-from scraper.scoring import ScoringConfig, classify_score, score_lead
+from scraper.scoring_output import ScoringConfig, classify_score, score_lead
 
 
 def full_lead():

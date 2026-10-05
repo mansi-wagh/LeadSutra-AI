@@ -1,8 +1,8 @@
 import pytest
 
-from scraper.models import BusinessRecord
-from scraper.profile import build_business_profile
-from scraper.website import WebsiteCrawlResult, WebsitePage, WebsiteStatus
+from scraper.discovery import BusinessRecord
+from scraper.enrichment import build_business_profile
+from scraper.enrichment import WebsiteCrawlResult, WebsitePage, WebsiteStatus
 
 
 def business():

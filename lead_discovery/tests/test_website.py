@@ -5,8 +5,8 @@ import asyncio
 import httpx
 import pytest
 
-from scraper.models import BusinessRecord
-from scraper.website import (
+from scraper.discovery import BusinessRecord
+from scraper.enrichment import (
     WebsiteCrawler, WebsiteCrawlerConfig, WebsiteStatus, _clean_page, normalize_url,
 )
 
@@ -15,6 +15,87 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 def business(url="https://acme.example"):
     return BusinessRecord.from_extracted({"business_name": "Acme", "website": url})
+
+
+def test_navigation_and_footer_links_remain_crawlable():
+    page, links = _clean_page('<nav><a href="/about">About</a></nav><main><p>Hello</p></main>'
+                             '<footer><a href="/contact">Contact</a></footer>', 'https://acme.example/')
+    assert page.main_text == "Hello"
+    assert {url for url, _ in links} == {'https://acme.example/about', 'https://acme.example/contact'}
+
+
+def test_failed_requests_consume_page_budget():
+    client = MockClient({'https://acme.example/': MockResponse('https://acme.example/',
+                        '<main>' + ''.join(f'<a href="/bad{i}">Bad</a>' for i in range(12)) + '</main>')})
+    asyncio.run(WebsiteCrawler(WebsiteCrawlerConfig(max_pages=2), client=client).crawl(business()))
+    assert len(client.calls) == 2
+
+
+def test_redirect_is_blocked_before_destination_request():
+    calls = []
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(302, headers={'location': 'http://127.0.0.1/private'})
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=True) as client:
+            return await WebsiteCrawler(client=client).crawl(business())
+    result = asyncio.run(run())
+    assert calls == ['https://acme.example/']
+    assert result.crawl_errors
+
+
+def test_trailing_slash_redirect_preserves_relative_link_base():
+    calls = []
+    def handler(request):
+        calls.append(str(request.url))
+        if request.url.path == '/about':
+            return httpx.Response(301, headers={'location': '/about/'})
+        return httpx.Response(200, headers={'content-type': 'text/html'}, text='<main><p>About us</p><a href="team">Team</a></main>')
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await WebsiteCrawler(WebsiteCrawlerConfig(max_pages=1), client=client).crawl(business('https://acme.example/about'))
+    result = asyncio.run(run())
+    assert calls == ['https://acme.example/about', 'https://acme.example/about/']
+    assert result.final_url == 'https://acme.example/about/'
+    assert result.website_content[0].outgoing_links[0].url == 'https://acme.example/about/team'
+    assert not result.crawl_errors
+
+
+def test_redirect_loop_is_reported_without_traceback(caplog):
+    calls = []
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(301, headers={'location': str(request.url)})
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await WebsiteCrawler(client=client).crawl(business())
+    result = asyncio.run(run())
+    assert len(calls) == 1
+    assert 'redirect loop' in result.crawl_errors[0].message
+    assert not any(record.exc_info for record in caplog.records)
+
+
+def test_crawl_deadline_preserves_successful_pages():
+    class SlowClient(MockClient):
+        async def get(self, url):
+            if url.endswith('/slow'):
+                await asyncio.sleep(10)
+            return await super().get(url)
+    client = SlowClient({'https://acme.example/': MockResponse('https://acme.example/', '<a href="/slow">Slow</a>')})
+    result = asyncio.run(WebsiteCrawler(WebsiteCrawlerConfig(crawl_timeout_seconds=0.03), client=client).crawl(business()))
+    assert len(result.website_content) == 1
+    assert result.website_status == WebsiteStatus.ACTIVE
+    assert 'deadline' in result.crawl_errors[-1].message
+
+
+def test_browser_start_failure_preserves_static_content():
+    class BrokenBrowser:
+        async def start(self): raise RuntimeError('browser unavailable')
+        async def close(self): pass
+    client = MockClient({'https://acme.example/': MockResponse('https://acme.example/', '<script>x</script><p>Useful</p>')})
+    result = asyncio.run(WebsiteCrawler(client=client, browser_manager_factory=lambda _: BrokenBrowser()).crawl(business()))
+    assert result.website_content[0].main_text == 'Useful'
+    assert any('browser unavailable' in error.message for error in result.crawl_errors)
 
 
 class MockResponse:
@@ -74,7 +155,7 @@ def test_cleanup_skips_descendants_of_removed_noisy_elements():
 
 
 def test_discovery_parser_rejects_none_html_and_malformed_card_attributes():
-    from scraper.parsing import parse_business_results
+    from scraper.discovery import parse_business_results
 
     assert parse_business_results(None) == []
     records = parse_business_results('<div role="article"><a href="/maps/place/acme" aria-label="Acme"></a><a href="tel:"></a></div>')

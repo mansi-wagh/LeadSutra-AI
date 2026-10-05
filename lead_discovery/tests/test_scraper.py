@@ -5,10 +5,10 @@ import asyncio
 import pytest
 from pydantic import ValidationError
 
-from scraper.browser import BrowserConfig, BrowserManager
+from scraper.discovery import BrowserConfig, BrowserManager
 from scraper.discovery import GoogleMapsBrowserDiscovery
-from scraper.models import BusinessRecord
-from scraper.parsing import parse_business_results, parse_latlon, parse_reviews
+from scraper.discovery import BusinessRecord
+from scraper.discovery import parse_business_results, parse_latlon, parse_reviews
 
 FIXTURE = Path(__file__).parent / "fixtures" / "maps_results.html"
 
@@ -82,7 +82,9 @@ def test_browser_configuration_and_initialization(monkeypatch):
         async def new_page(self): return page
         async def close(self): pass
     class Browser:
-        async def new_context(self): return context
+        async def new_context(self, **kwargs):
+            assert kwargs["service_workers"] == "block"
+            return context
         async def close(self): pass
     class Chromium:
         async def launch(self, **kwargs):
@@ -94,7 +96,7 @@ def test_browser_configuration_and_initialization(monkeypatch):
     class Starter:
         async def start(self): return playwright
     page, context, browser, playwright = Page(), Context(), Browser(), Playwright()
-    monkeypatch.setattr("scraper.browser.async_playwright", lambda: Starter())
+    monkeypatch.setattr("scraper.discovery.async_playwright", lambda: Starter())
     manager = BrowserManager(BrowserConfig(headless=True, navigation_timeout_ms=1234))
     result = asyncio.run(manager.start())
     assert result is page
@@ -119,7 +121,7 @@ def test_configurable_limit_and_browser_failure(monkeypatch):
         asyncio.run(discovery.search("cafes", "Bengaluru", limit=0))
 
 
-def test_navigation_failure_returns_empty(monkeypatch):
+def test_navigation_failure_is_reported(monkeypatch):
     from playwright.async_api import Error as PlaywrightError
 
     class FakePage:
@@ -130,4 +132,39 @@ def test_navigation_failure_returns_empty(monkeypatch):
         async def start(self): return FakePage()
         async def close(self): pass
     monkeypatch.setattr("scraper.discovery.BrowserManager", FakeManager)
-    assert asyncio.run(GoogleMapsBrowserDiscovery().search("cafes", "Bengaluru", limit=4)) == []
+    with pytest.raises(PlaywrightError, match='navigation failed'):
+        asyncio.run(GoogleMapsBrowserDiscovery().search("cafes", "Bengaluru", limit=4))
+
+
+def test_maps_details_overlap_and_preserve_failed_records(monkeypatch):
+    from playwright.async_api import Error as PlaywrightError
+    active = peak = closed = 0
+    records = [BusinessRecord(lead_id=str(i), business_name=f'Business {i}',
+                              source_url=f'https://www.google.com/maps/place/{i}') for i in range(5)]
+    class Page:
+        url = 'https://www.google.com/maps/'
+        async def goto(self, *args, **kwargs): pass
+        async def wait_for_timeout(self, *args): pass
+        async def content(self): return ''
+    class Detail(Page):
+        async def goto(self, url, **kwargs):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.01)
+            if url.endswith('/2'):
+                raise PlaywrightError('detail failed')
+        async def close(self):
+            nonlocal active, closed
+            active -= 1
+            closed += 1
+    class Manager:
+        def __init__(self, config): self.context = self
+        async def start(self): return Page()
+        async def new_page(self): return Detail()
+        async def close(self): pass
+    monkeypatch.setattr('scraper.discovery.BrowserManager', Manager)
+    monkeypatch.setattr('scraper.discovery.parse_business_results', lambda *args: records)
+    result = asyncio.run(GoogleMapsBrowserDiscovery().search('Dentist', 'Nashik', 5))
+    assert result == records
+    assert peak == 3 and closed == 5 and active == 0

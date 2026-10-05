@@ -1,9 +1,9 @@
-from scraper.contact import extract_contacts
-from scraper.extractors import extract_all, extract_requested
-from scraper.models import BusinessRecord
-from scraper.social import extract_social_media
-from scraper.technology import detect_technologies
-from scraper.website import WebsiteCrawlResult, WebsiteLink, WebsitePage, WebsiteStatus, _clean_page
+from scraper.enrichment import extract_contacts
+from scraper.enrichment import extract_all, extract_requested
+from scraper.discovery import BusinessRecord
+from scraper.enrichment import extract_social_media
+from scraper.enrichment import detect_technologies
+from scraper.enrichment import WebsiteCrawlResult, WebsiteLink, WebsitePage, WebsiteStatus, _clean_page
 
 
 def business():

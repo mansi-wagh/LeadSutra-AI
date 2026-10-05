@@ -3,9 +3,9 @@ import json
 
 import pytest
 
-from scraper.models import BusinessRecord
-from scraper.orchestrator import ScraperOrchestrator
-from scraper.website import CrawlError, WebsiteCrawlResult, WebsiteLink, WebsitePage, WebsiteStatus
+from scraper.discovery import BusinessRecord
+from scraper.main import ScraperOrchestrator
+from scraper.enrichment import CrawlError, WebsiteCrawlResult, WebsiteLink, WebsitePage, WebsiteStatus
 
 
 def make_business(lead_id="lead-a"):
@@ -60,7 +60,7 @@ def setup(tmp_path, monkeypatch, *, no_pages=False, fail_contacts=False, records
         return item
     if fail_contacts:
         monkeypatch.setattr(
-            "scraper.orchestrator.extract_contacts",
+            "scraper.main.extract_contacts",
             lambda *args: (_ for _ in ()).throw(RuntimeError("mock contact failure")),
         )
     app = ScraperOrchestrator(
@@ -73,6 +73,71 @@ def call(app, mode, **kwargs):
     return asyncio.run(app.run("dentists", "Nashik", 20, mode, **kwargs))
 
 
+@pytest.mark.parametrize('selection', [{'custom_fields': ['technology_stack']}, {'custom_modules': ['technology']}])
+def test_custom_technology_survives_export(tmp_path, monkeypatch, selection):
+    app, _, _ = setup(tmp_path, monkeypatch)
+    run = call(app, 'custom', **selection)
+    payload = json.loads((run.output_dir / 'leads.json').read_text())
+    assert payload[0]['website_analysis']['technology_stack'] == ['WordPress']
+
+
+def test_discovery_failure_is_failed_and_printed(tmp_path, caplog):
+    class BrokenDiscovery:
+        async def search(self, *args): raise RuntimeError('provider unavailable')
+    messages = []
+    run = call(ScraperOrchestrator(discovery=BrokenDiscovery(), output_root=tmp_path, progress=messages.append), 'basic')
+    assert run.summary['status'] == 'failed'
+    assert any('provider unavailable' in message for message in messages)
+    assert 'provider unavailable' not in caplog.text  # Progress callback owns console delivery.
+
+
+def test_failure_without_progress_callback_is_logged_once(tmp_path, caplog):
+    class BrokenDiscovery:
+        async def search(self, *args): raise RuntimeError('provider unavailable')
+    call(ScraperOrchestrator(discovery=BrokenDiscovery(), output_root=tmp_path), 'basic')
+    errors = [record for record in caplog.records if 'provider unavailable' in record.getMessage()]
+    assert len(errors) == 1
+    assert not errors[0].exc_info
+
+
+def test_logging_progress_callback_does_not_duplicate_errors(tmp_path, caplog):
+    import logging
+    class BrokenDiscovery:
+        async def search(self, *args): raise RuntimeError('provider unavailable')
+    call(ScraperOrchestrator(discovery=BrokenDiscovery(), output_root=tmp_path,
+                            progress=logging.getLogger('test.progress').warning), 'basic')
+    assert sum('provider unavailable' in record.getMessage() for record in caplog.records) == 1
+
+
+def test_zero_results_is_success(tmp_path):
+    run = call(ScraperOrchestrator(discovery=FakeDiscovery([]), output_root=tmp_path), 'basic')
+    assert run.summary['status'] == 'success'
+
+
+def test_crawls_overlap_with_limit_and_preserve_order_and_failures(tmp_path):
+    active = peak = 0
+    class Crawler:
+        async def crawl(self, record):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            try:
+                await asyncio.sleep(0.01)
+                if record.lead_id == 'lead-2':
+                    raise RuntimeError('one site failed')
+                return make_site(record.lead_id)
+            finally:
+                active -= 1
+    records = [make_business(f'lead-{i}') for i in range(5)]
+    app = ScraperOrchestrator(discovery=FakeDiscovery(records), output_root=tmp_path,
+                             website_crawler_factory=lambda *_: Crawler())
+    run = call(app, 'website')
+    assert peak == 3
+    assert [lead.business.lead_id for lead in run.leads] == [record.lead_id for record in records]
+    assert run.leads[2].extraction_metadata.module_status['website'] == 'failed'
+    assert run.summary['timings_seconds']['websites'] > 0
+
+
 def test_basic_never_crawls_and_writes_consistent_json(tmp_path, monkeypatch):
     app, crawlers, _ = setup(tmp_path, monkeypatch)
     run = call(app, "basic")
@@ -83,14 +148,19 @@ def test_basic_never_crawls_and_writes_consistent_json(tmp_path, monkeypatch):
     assert lead["lead_scoring"]["lead_score"] is None
     assert lead["lead_scoring"]["score_breakdown"] == {}
     assert json.loads((run.output_dir / "leads.json").read_text())[0]["lead_id"] == "lead-a"
-    assert json.loads((run.output_dir / "summary.json").read_text())["total_businesses"] == 1
+    assert json.loads((run.output_dir / "summary.json").read_text())["businesses_discovered"] == 1
     report = run.extraction_report
     assert report["total_businesses"] == 1
     assert report["field_coverage"]["profile.services"]["not_requested"] == 1
-    assert {item.name for item in run.output_dir.iterdir()} == {"leads.json", "summary.json"}
+    assert {item.name for item in run.output_dir.iterdir()} == {"leads.json", "summary.json", "scraper.log"}
+    assert "[START]" in (run.output_dir / "scraper.log").read_text(encoding="utf-8")
     summary = json.loads((run.output_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["status"] == "degraded"
-    assert "warnings" in summary and "module_statuses" in summary
+    assert "warnings" not in summary and "module_statuses" not in summary
+    assert summary["businesses_discovered"] == 1
+    formatted_leads = (run.output_dir / "leads.json").read_text(encoding="utf-8")
+    assert formatted_leads.startswith('[\n  {\n    "lead_id"')
+    assert '\n    "business": {' in formatted_leads
 
 
 def test_zero_must_have_coverage_degrades_run_and_preserves_nulls(tmp_path, monkeypatch, caplog):
@@ -102,15 +172,15 @@ def test_zero_must_have_coverage_degrades_run_and_preserves_nulls(tmp_path, monk
     assert payload["business"]["latitude"] is None
     assert payload["business"]["longitude"] is None
     assert payload["business"]["rating"] is None
-    assert payload["business"]["review_count"] is None
+    assert "review_count" not in payload["business"]
     assert summary["status"] == "degraded"
-    assert "0% coverage: business.review_count" in summary["warnings"]
+    assert "0% coverage: business.review_count" in run.summary["warnings"]
     assert "0% coverage: business.latitude" in caplog.text
-    assert {item.name for item in run.output_dir.iterdir()} == {"leads.json", "summary.json"}
+    assert {item.name for item in run.output_dir.iterdir()} == {"leads.json", "summary.json", "scraper.log"}
 
 
 def test_score_evidence_is_short_deduplicated_and_traceable():
-    from scraper.output_schema import compact_scoring_evidence
+    from scraper.scoring_output import compact_scoring_evidence
 
     repeated = {"value": "Verified service detail " * 30, "source_urls": ["https://clinic.example/services"]}
     scoring = {"factor": {"evidence_used": [repeated, repeated]}}
@@ -224,7 +294,7 @@ def test_qualification_filters_and_ranks_larger_candidate_pool(tmp_path, monkeyp
         "lead-4": ("Qualified", 76), "lead-5": ("Not Qualified", 20),
     }
     monkeypatch.setattr(
-        "scraper.orchestrator.score_lead",
+        "scraper.main.score_lead",
         lambda lead, config: {
             "lead_score": ranked[lead["lead_id"]][1],
             "priority": "High", "qualification_status": ranked[lead["lead_id"]][0],
@@ -249,7 +319,7 @@ def test_qualification_filters_and_ranks_larger_candidate_pool(tmp_path, monkeyp
 def test_qualification_returns_fewer_than_limit_if_not_enough_match(tmp_path, monkeypatch):
     records = [make_business(f"lead-{index}") for index in range(3)]
     monkeypatch.setattr(
-        "scraper.orchestrator.score_lead",
+        "scraper.main.score_lead",
         lambda lead, config: {
             "lead_score": 85 if lead["lead_id"] == "lead-1" else 25,
             "priority": "Medium", "qualification_status": "Qualified" if lead["lead_id"] == "lead-1" else "Not Qualified",
@@ -287,7 +357,7 @@ def test_scoring_mode_is_independent_and_does_not_crawl(tmp_path, monkeypatch):
 
 def test_scoring_failure_preserves_enriched_business_data(tmp_path, monkeypatch):
     app, _, _ = setup(tmp_path, monkeypatch)
-    monkeypatch.setattr("scraper.orchestrator.score_lead", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("score error")))
+    monkeypatch.setattr("scraper.main.score_lead", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("score error")))
     lead = call(app, "full").leads[0]
     assert lead.business.business_name == "Acme Studio"
     assert lead.profile is not None and lead.contacts is not None
@@ -352,7 +422,8 @@ def test_discovery_data_and_source_diagnostics_survive_website_failure(tmp_path,
     app.website_crawler_factory = lambda config, browser: FakeCrawler(config, browser, failed_site)
     run = call(app, "full")
     payload = json.loads((run.output_dir / "leads.json").read_text(encoding="utf-8"))[0]
-    assert payload["business"]["business_name"] == "Verified Dental"
+    assert payload["business"]["name"] == "Verified Dental"
+    assert "review_count" not in payload["business"]
     assert payload["business"]["phone"] == "+911234567890"
     assert payload["business"]["rating"] == 4.8
     report = run.extraction_report
@@ -383,9 +454,10 @@ def test_each_mode_has_the_same_canonical_top_level_schema(tmp_path, monkeypatch
 
 def test_serialized_contract_is_clean_and_constant_across_modes(tmp_path, monkeypatch):
     expected_top = {"lead_id", "business", "profile", "website_analysis", "contacts", "social_links", "lead_scoring"}
-    expected_website = {"status", "website_url", "about", "services", "contact_page_url", "technology_stack"}
-    expected_profile = {"services", "products", "target_customers", "about_info", "business_description", "operating_hours"}
-    expected_contacts = {"contact_person", "emails", "phone_numbers", "contact_page_url"}
+    expected_business = {"name", "category", "sub_category", "description", "address", "phone", "email", "website", "latitude", "longitude", "rating"}
+    expected_website = {"status", "services", "about", "contact_page_url", "technology_stack"}
+    expected_profile = {"services", "products", "target_customers", "about_info", "operating_hours"}
+    expected_contacts = {"contact_person", "emails", "phone_numbers"}
     for mode in ("basic", "website", "profile", "contacts", "social", "technology", "full", "scoring", "custom"):
         app, _, _ = setup(tmp_path / mode, monkeypatch)
         kwargs = {"custom_fields": ["services", "instagram"]} if mode == "custom" else {}
@@ -394,27 +466,38 @@ def test_serialized_contract_is_clean_and_constant_across_modes(tmp_path, monkey
         lead = leads[0]
         assert set(lead) == expected_top
         assert lead["lead_id"] == "lead-a"
-        assert "lead_id" not in lead["business"] and "lead_id" not in lead["profile"]
+        assert set(lead["business"]) == expected_business
+        assert lead["business"]["name"] == "Acme Studio"
         assert set(lead["profile"]) == expected_profile
         assert set(lead["website_analysis"]) == expected_website
         assert set(lead["contacts"]) == expected_contacts
-        assert set(lead["social_links"]) == {"facebook", "instagram", "linkedin", "twitter"}
+        assert set(lead["social_links"]) == {"facebook", "instagram", "linkedin"}
         if mode == "full":
             assert lead["lead_scoring"]["lead_score"] is not None
-            assert lead["lead_scoring"]["score_breakdown"]["evidence_coverage"] <= 100
         elif mode == "scoring":
-            assert lead["lead_scoring"]["score_breakdown"]["evidence_coverage"] < 60
             assert lead["lead_scoring"]["qualification_status"] == "Needs Review"
         else:
             assert lead["lead_scoring"] == {
-                "lead_score": None, "priority": "Unknown", "qualification_status": "Unknown", "score_breakdown": {}
+                "lead_score": None, "priority": "Unknown", "qualification_status": "Unknown"
             }
+        assert set(lead["lead_scoring"]) == {"lead_score", "priority", "qualification_status"}
         assert isinstance(lead["profile"]["services"], list)
         assert isinstance(lead["profile"]["operating_hours"], dict)
         assert lead["website_analysis"]["status"] in {"not_checked", "active", "not_found", "invalid_url", "unreachable", "blocked", "uncertain"}
         assert "website_content" not in lead["website_analysis"]
         schema = run.summary["schema_validation"]
         assert schema == {"status": "valid", "schema": "LeadOutput", "validated_records": 1, "errors": []}
+
+
+def test_export_omits_score_breakdown_and_keeps_internal_scoring_evidence(tmp_path, monkeypatch):
+    app, _, _ = setup(tmp_path, monkeypatch)
+    run = call(app, "full")
+    payload = json.loads((run.output_dir / "leads.json").read_text(encoding="utf-8"))[0]
+
+    assert "score_breakdown" not in payload["lead_scoring"]
+    assert payload["business"]["website"] == "https://acme.example"
+    # Detailed evidence remains available internally to scoring, but not in leads.json.
+    assert "evidence_used" in run.leads[0].lead_scoring.score_breakdown["business_relevance"]["factors"]["category_relevance"]
 
 
 def test_serialized_contract_validates_every_record_and_uses_empty_collection_defaults(tmp_path, monkeypatch):
@@ -432,7 +515,7 @@ def test_serialized_contract_validates_every_record_and_uses_empty_collection_de
 
 
 def test_serializer_rejects_malformed_internal_profile_instead_of_dropping_it(tmp_path, monkeypatch):
-    from scraper.orchestrator import _validate_output_payloads
+    from scraper.main import _validate_output_payloads
 
     app, _, _ = setup(tmp_path, monkeypatch)
     lead = call(app, "profile").leads[0]
@@ -442,7 +525,7 @@ def test_serializer_rejects_malformed_internal_profile_instead_of_dropping_it(tm
 
 
 def test_canonical_model_rejects_nested_ids_and_wrong_collection_types(tmp_path, monkeypatch):
-    from scraper.output_schema import LeadOutput
+    from scraper.scoring_output import LeadOutput
 
     app, _, _ = setup(tmp_path, monkeypatch)
     payload = json.loads((call(app, "basic").output_dir / "leads.json").read_text(encoding="utf-8"))[0]

@@ -1,31 +1,25 @@
+"""CLI and end-to-end run flow for LeadSutra scraper."""
 from __future__ import annotations
 
+import argparse
+import asyncio
 import json
 import logging
 import re
 import uuid
+from time import perf_counter
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterable
-
 from pydantic import BaseModel, Field
-
-from .browser import BrowserConfig
-from .contact import ContactExtraction, extract_contacts, normalize_phone
-from .discovery import BusinessDiscovery
-from .models import BusinessRecord
-from .output_schema import LeadOutput, compact_scoring_evidence
-from .profile import BusinessProfile, build_business_profile, extract_profile_about, extract_profile_services
-from .social import SocialMediaExtraction, extract_social_media
-from .scoring import ScoringConfig, score_lead
-from .technology import TechnologyExtraction, detect_technologies
-from .website import WebsiteCrawlResult, WebsiteCrawler, WebsiteCrawlerConfig, WebsitePage, WebsiteStatus
+from typing import Any, Callable, Iterable
+from .discovery import BrowserConfig, BusinessDiscovery, BusinessRecord
+from .enrichment import BusinessProfile, ContactExtraction, SocialMediaExtraction, TechnologyExtraction, WebsiteCrawlResult, WebsiteCrawler, WebsiteCrawlerConfig, WebsitePage, WebsiteStatus, build_business_profile, detect_technologies, extract_contacts, extract_profile_about, extract_profile_services, extract_social_media, normalize_phone
+from .scoring_output import LeadOutput, ScoringConfig, score_lead
 
 logger = logging.getLogger(__name__)
-
 
 class ExtractionMode(str, Enum):
     BASIC = "basic"
@@ -38,7 +32,6 @@ class ExtractionMode(str, Enum):
     SCORING = "scoring"
     CUSTOM = "custom"
 
-
 class ModuleStatus(str, Enum):
     SUCCESS = "success"
     PARTIAL = "partial"
@@ -46,7 +39,6 @@ class ModuleStatus(str, Enum):
     NOT_REQUESTED = "not_requested"
     NOT_AVAILABLE = "not_available"
     SKIPPED = "skipped"
-
 
 MODULES = ("business_discovery", "website", "profile", "contacts", "social", "technology", "lead_scoring")
 MUST_COVERAGE_FIELDS = ("business.latitude", "business.longitude", "business.review_count", "business.rating")
@@ -68,7 +60,6 @@ FIELD_MODULES = {
     "business": "business_discovery", "business_info": "business_discovery",
 }
 
-
 class BusinessOutput(BaseModel):
     lead_id: str
     business_name: str
@@ -84,13 +75,11 @@ class BusinessOutput(BaseModel):
     rating: float | None = None
     review_count: int | None = None
 
-
 class LeadScoringOutput(BaseModel):
     lead_score: float | None = None
     priority: str = "Unknown"
     qualification_status: str = "Unknown"
     score_breakdown: dict[str, Any] = Field(default_factory=dict)
-
 
 class ExtractionMetadata(BaseModel):
     requested_modules: list[str]
@@ -106,7 +95,6 @@ class ExtractionMetadata(BaseModel):
     overall_status: str = "success"
     extraction_status: str
 
-
 class CanonicalLeadOutput(BaseModel):
     business: BusinessOutput
     profile: dict[str, Any] | None = None
@@ -116,7 +104,6 @@ class CanonicalLeadOutput(BaseModel):
     lead_scoring: LeadScoringOutput = Field(default_factory=LeadScoringOutput)
     extraction_metadata: ExtractionMetadata
 
-
 @dataclass
 class ScrapeRun:
     run_id: str
@@ -125,12 +112,10 @@ class ScrapeRun:
     summary: dict[str, Any]
     extraction_report: dict[str, Any]
 
-
 def _error_text(exc: Exception) -> str:
     message = re.sub(r"https?://\S+", "[url]", str(exc)[:400], flags=re.I)
     message = re.sub(r"(?i)(password|passwd|token|api[_-]?key|secret)=([^&\s]+)", r"\1=[redacted]", message)
     return f"{type(exc).__name__}: {message}"
-
 
 def _modules_for_mode(mode: ExtractionMode) -> list[str]:
     return {
@@ -144,7 +129,6 @@ def _modules_for_mode(mode: ExtractionMode) -> list[str]:
         ExtractionMode.SCORING: ["business_discovery", "lead_scoring"],
         ExtractionMode.CUSTOM: [],
     }[mode]
-
 
 def _custom_selection(
     modules: Iterable[str] | None, fields: Iterable[str] | None,
@@ -173,7 +157,6 @@ def _custom_selection(
     if not selected:
         raise ValueError("CUSTOM mode requires at least one --module or --field")
     return selected, dict(by_field), whole
-
 
 def _requested_field_paths(mode: ExtractionMode, selected: list[str], fields: Iterable[str] | None, whole: set[str]) -> list[str]:
     paths = [f"business.{name}" for name in BUSINESS_FIELDS]
@@ -212,7 +195,6 @@ def _requested_field_paths(mode: ExtractionMode, selected: list[str], fields: It
                 paths.append(f"website_analysis.{name}")
     return list(dict.fromkeys(paths))
 
-
 def _profile_payload(profile: BusinessProfile, only_fields: set[str] | None = None) -> dict[str, Any]:
     data = profile.model_dump(mode="json")
     if only_fields is not None:
@@ -221,7 +203,6 @@ def _profile_payload(profile: BusinessProfile, only_fields: set[str] | None = No
                 data[name] = None
         data["field_sources"] = {key: val for key, val in data["field_sources"].items() if key in only_fields}
     return data
-
 
 def _website_payload(site: WebsiteCrawlResult, technology: TechnologyExtraction | None = None) -> dict[str, Any]:
     return {
@@ -237,7 +218,6 @@ def _website_payload(site: WebsiteCrawlResult, technology: TechnologyExtraction 
         "crawl_errors": [item.model_dump(mode="json") for item in site.crawl_errors],
     }
 
-
 def _contact_payload(contact: ContactExtraction) -> dict[str, Any]:
     return {
         "contact_person": contact.contact_person.model_dump(mode="json") if contact.contact_person else None,
@@ -246,11 +226,9 @@ def _contact_payload(contact: ContactExtraction) -> dict[str, Any]:
         "contact_page_url": contact.contact_page_url,
     }
 
-
 def _social_payload(social: SocialMediaExtraction) -> dict[str, Any]:
     return {key: getattr(social, key).model_dump(mode="json") if getattr(social, key) else None
             for key in ("facebook", "instagram", "linkedin", "twitter")}
-
 
 def _plain_profile(profile: dict[str, Any] | None) -> dict[str, Any]:
     profile = profile or {}
@@ -268,9 +246,6 @@ def _plain_profile(profile: dict[str, Any] | None) -> dict[str, Any]:
                 output.append(item["value"].strip())
         return output
     about_items = facts("about_info")
-    description = profile.get("business_description")
-    if isinstance(description, dict):
-        description = description.get("value")
     hours: dict[str, Any] = {}
     raw_hours = profile.get("operating_hours")
     if raw_hours is not None and not isinstance(raw_hours, list):
@@ -283,16 +258,16 @@ def _plain_profile(profile: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "services": facts("services"), "products": facts("products"),
         "target_customers": facts("target_customers"),
-        "about_info": " ".join(about_items) or None,
-        "business_description": description if isinstance(description, str) and description.strip() else None,
+        "about_info": " ".join(about_items) or "",
         "operating_hours": hours,
     }
-
 
 def _clean_lead_payload(lead: CanonicalLeadOutput) -> dict[str, Any]:
     internal = lead.model_dump(mode="json")
     business = dict(internal["business"])
     lead_id = business.pop("lead_id")
+    business["name"] = business.pop("business_name")
+    business.pop("review_count", None)
     profile = _plain_profile(internal.get("profile"))
     website = internal.get("website_analysis") or {}
     profile_services = profile["services"]
@@ -316,7 +291,6 @@ def _clean_lead_payload(lead: CanonicalLeadOutput) -> dict[str, Any]:
             raise TypeError(f"website_analysis.technology_stack[{index}] expected technology name")
     clean_website = {
         "status": website.get("status") or "not_checked",
-        "website_url": website.get("website_url") if website.get("status") != "not_checked" else None,
         "about": website_about,
         "services": list(dict.fromkeys(profile_services)),
         "contact_page_url": website.get("contact_page_url"),
@@ -349,19 +323,19 @@ def _clean_lead_payload(lead: CanonicalLeadOutput) -> dict[str, Any]:
             raise TypeError("contacts.contact_person expected string evidence value")
     contacts = {"contact_person": person,
                 "emails": contact_values("emails", "email"),
-                "phone_numbers": contact_values("phone_numbers", "normalized", "value"),
-                "contact_page_url": contacts.get("contact_page_url")}
+                "phone_numbers": contact_values("phone_numbers", "normalized", "value")}
     social = internal.get("social_links") or {key: None for key in ("facebook", "instagram", "linkedin", "twitter")}
-    social = {key: value.get("url") if isinstance(value, dict) else value
-              for key, value in social.items()}
+    social = {key: (social.get(key).get("url") if isinstance(social.get(key), dict) else social.get(key))
+              for key in ("facebook", "instagram", "linkedin")}
     scoring = internal["lead_scoring"]
-    scoring["priority"] = scoring.get("priority") or "Unknown"
-    scoring["qualification_status"] = scoring.get("qualification_status") or "Unknown"
-    compact_scoring_evidence(scoring.get("score_breakdown", {}))
+    scoring = {
+        "lead_score": scoring.get("lead_score"),
+        "priority": scoring.get("priority") or "Unknown",
+        "qualification_status": scoring.get("qualification_status") or "Unknown",
+    }
     return {"lead_id": lead_id, "business": business, "profile": profile,
             "website_analysis": clean_website, "contacts": contacts,
             "social_links": social, "lead_scoring": scoring}
-
 
 def _validate_output_payloads(leads: list[CanonicalLeadOutput]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Serialize and validate every exported record before any artifact is written."""
@@ -405,8 +379,7 @@ def _validate_output_payloads(leads: list[CanonicalLeadOutput]) -> tuple[list[di
         "status": "valid", "schema": "LeadOutput", "validated_records": len(payloads), "errors": [],
     }
 
-
-class ScraperOrchestrator:
+class ScraperService:
     def __init__(
         self,
         *,
@@ -431,6 +404,8 @@ class ScraperOrchestrator:
     def _emit(self, message: str) -> None:
         if self.progress:
             self.progress(message)
+        elif message.startswith(("[WARNING]", "[ERROR]")):
+            logger.log(logging.ERROR if message.startswith("[ERROR]") else logging.WARNING, message)
 
     def _emit_detail(self, message: str) -> None:
         if self.verbose:
@@ -487,6 +462,7 @@ class ScraperOrchestrator:
         needs_website = "website" in selected or needs_enrichment
 
         started = datetime.now(timezone.utc)
+        run_clock = perf_counter()
         run_id = started.strftime("run_%Y%m%d_%H%M%S_%f") + "_" + uuid.uuid4().hex[:6]
         output_dir = self.output_root / run_id
         output_dir.mkdir(parents=True, exist_ok=False)
@@ -517,6 +493,8 @@ class ScraperOrchestrator:
         }
         logs.append("[DISCOVERY_SOURCE] " + json.dumps(discovery_diagnostics, ensure_ascii=False, default=str))
         logs.extend("[WARNING] " + warning for warning in run_warnings)
+        for warning in run_warnings:
+            self._emit("[ERROR] " + warning)
         logs.append(f"[DISCOVERY] businesses={len(records)} status={discovery_status.value}")
         self._emit(f"[DISCOVERY] Business discovery completed ({len(records)} businesses)")
         self._emit(
@@ -524,7 +502,24 @@ class ScraperOrchestrator:
             f"browser fallback: {'used' if discovery_diagnostics.get('fallback_used') else 'not used'}"
         )
 
-        supplied_sites = website_results or {}
+        discovery_seconds = perf_counter() - run_clock
+        supplied_sites = dict(website_results or {})
+        crawl_errors: dict[str, Exception] = {}
+        if needs_website:
+            semaphore = asyncio.Semaphore(self.website_config.concurrency)
+
+            async def crawl(record):
+                if record.lead_id in supplied_sites:
+                    return
+                async with semaphore:
+                    try:
+                        crawler = self.website_crawler_factory(self.website_config, self.browser_config)
+                        supplied_sites[record.lead_id] = await crawler.crawl(record)
+                    except Exception as exc:
+                        crawl_errors[record.lead_id] = exc
+
+            await asyncio.gather(*(crawl(record) for record in records))
+        website_seconds = perf_counter() - run_clock - discovery_seconds
         leads: list[CanonicalLeadOutput] = []
         events: list[dict[str, Any]] = []
         for record in records:
@@ -542,13 +537,10 @@ class ScraperOrchestrator:
 
             if needs_website:
                 if site is None:
-                    try:
-                        crawler = self.website_crawler_factory(self.website_config, self.browser_config)
-                        site = await crawler.crawl(record)
-                    except Exception as exc:
-                        statuses["website"] = ModuleStatus.FAILED
-                        warnings.append("Website extraction failed: " + _error_text(exc))
-                        logs.append(f"[ERROR] business={record.lead_id} module=website {_error_text(exc)}")
+                    exc = crawl_errors.get(record.lead_id, RuntimeError("Website crawler returned no result"))
+                    statuses["website"] = ModuleStatus.FAILED
+                    warnings.append("Website extraction failed: " + _error_text(exc))
+                    logs.append(f"[ERROR] business={record.lead_id} module=website {_error_text(exc)}")
                 if site is not None:
                     if site.website_status == WebsiteStatus.NOT_FOUND:
                         statuses["website"] = ModuleStatus.NOT_AVAILABLE
@@ -666,7 +658,9 @@ class ScraperOrchestrator:
             if ("website" in selected or "technology" in selected) and website_out is None:
                 website_out = _empty_website(record.website, "unreachable")
             if website_out is not None and selected_mode == ExtractionMode.CUSTOM and "website" not in whole_modules:
-                allowed = field_selection.get("website", set())
+                allowed = set(field_selection.get("website", set()))
+                if "technology" in selected:
+                    allowed.add("technology_stack")
                 for key in WEBSITE_FIELDS:
                     if key not in allowed:
                         website_out[key] = None
@@ -765,8 +759,9 @@ class ScraperOrchestrator:
                 extraction_metadata=metadata,
             )
             for warning in warnings:
-                safe_warning = re.sub(r"https?://\S+", "[url]", warning, flags=re.I)
+                safe_warning = " ".join(re.sub(r"https?://\S+", "[url]", warning, flags=re.I).split())
                 logs.append(f"[WARNING] business={record.lead_id} {safe_warning}")
+                self._emit(f"[WARNING] business={record.lead_id} {safe_warning}")
             leads.append(lead)
             events.append({
                 "lead_id": record.lead_id,
@@ -860,7 +855,7 @@ class ScraperOrchestrator:
         }
         report = _make_report(candidate_leads, events, requested, run_warnings)
         report["discovery"] = discovery_diagnostics
-        bad_coverage = [path for path in MUST_COVERAGE_FIELDS
+        bad_coverage = [path for path in MUST_COVERAGE_FIELDS if candidate_leads
                         if report["field_coverage"].get(path, {}).get("available", 0) == 0]
         coverage_warnings = [f"0% coverage: {path}" for path in bad_coverage]
         for warning in coverage_warnings:
@@ -875,7 +870,7 @@ class ScraperOrchestrator:
         all_warnings.extend(coverage_warnings)
         all_warnings = list(dict.fromkeys(all_warnings))
         summary.update({
-            "status": "degraded" if bad_coverage else "failed" if discovery_status == ModuleStatus.FAILED else "success",
+            "status": "failed" if discovery_status == ModuleStatus.FAILED else "degraded" if bad_coverage or any(event["enrichment_error"] for event in events) else "success",
             "total_leads": len(leads),
             "field_coverage": report["field_coverage"],
             "module_statuses": report["module_statuses"],
@@ -884,11 +879,20 @@ class ScraperOrchestrator:
             "schema_validation": schema_validation,
         })
         ended = datetime.now(timezone.utc)
+        summary["timings_seconds"] = {
+            "discovery": round(discovery_seconds, 3), "websites": round(website_seconds, 3),
+            "total": round(perf_counter() - run_clock, 3),
+        }
+        timing_message = "[TIMING] " + json.dumps(summary["timings_seconds"])
+        logs.append(timing_message)
+        self._emit(timing_message)
         logs.extend([f"[QUALIFICATION] filter={qualification_key} candidates={len(candidate_leads)} matched={len(matching)} returned={len(leads)}",
                      f"[SUMMARY] total={len(leads)} candidates={len(candidate_leads)} successful={counts['success']} partial={counts['partial']} failed={counts['failed']}",
+                     f"[SAVED] {output_dir / 'leads.json'}", f"[SAVED] {output_dir / 'summary.json'}",
+                     f"[SAVED] {output_dir / 'scraper.log'}",
                      f"[END] {ended.isoformat()}"])
-        _write_artifacts(output_dir, summary, serialized_leads=serialized_leads)
-        for name in ("leads.json", "summary.json"):
+        _write_artifacts(output_dir, summary, logs=logs, serialized_leads=serialized_leads)
+        for name in ("leads.json", "summary.json", "scraper.log"):
             self._emit(f"[SAVED] {output_dir / name}")
         self._emit(f"[DISCOVERY] Requested: {limit}; candidates examined: {len(candidate_leads)}; discovery failures: {discovery_failures}")
         if qualified_label is not None:
@@ -906,23 +910,23 @@ class ScraperOrchestrator:
         )
         return ScrapeRun(run_id, output_dir, leads, summary, report)
 
+# Retain the former class name for callers using the established Python API.
+ScraperOrchestrator = ScraperService
+
 
 def _empty_website(website_url: str | None, status: str = "not_checked") -> dict[str, Any]:
     return {"status": status, "website_url": website_url, "final_url": None, "website_content": [],
             "about": [], "services": None, "contact_page_url": None, "technology_stack": None,
             "pages_visited": [], "crawl_errors": []}
 
-
 def _requested_field(lead: CanonicalLeadOutput, path: str) -> bool:
     return path in lead.extraction_metadata.requested_fields
-
 
 def _value_at(lead: CanonicalLeadOutput, path: str) -> Any:
     value: Any = lead.model_dump(mode="json")
     for part in path.split("."):
         value = value.get(part) if isinstance(value, dict) else None
     return value
-
 
 def _make_report(leads: list[CanonicalLeadOutput], events: list[dict[str, Any]], requested: list[str], run_warnings: list[str]) -> dict[str, Any]:
     paths = [
@@ -983,7 +987,46 @@ def _make_report(leads: list[CanonicalLeadOutput], events: list[dict[str, Any]],
         "run_warnings": run_warnings,
     }
 
+def _write_artifacts(
+    output_dir: Path, summary: dict[str, Any], *, logs: list[str], serialized_leads: list[dict[str, Any]],
+) -> None:
+    # Keep the lead records readable and the saved run summary focused on key counts.
+    (output_dir / "leads.json").write_text(
+        json.dumps(serialized_leads, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    short_summary = {
+        key: summary[key] for key in (
+            "run_id", "status", "search_query", "location", "requested_limit",
+            "businesses_discovered", "discovery_failures", "businesses_fully_enriched",
+            "businesses_partially_enriched", "businesses_without_available_website",
+            "businesses_with_enrichment_errors", "total_leads", "qualification_summary",
+            "timings_seconds",
+        ) if key in summary
+    }
+    (output_dir / "summary.json").write_text(
+        json.dumps(short_summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+    )
+    (output_dir / "scraper.log").write_text("\n".join(logs) + "\n", encoding="utf-8")
 
-def _write_artifacts(output_dir: Path, summary: dict[str, Any], *, serialized_leads: list[dict[str, Any]]) -> None:
-    (output_dir / "leads.json").write_text(json.dumps(serialized_leads, ensure_ascii=False, indent=2), encoding="utf-8")
-    (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="LeadSutra business scraper")
+    parser.add_argument("--query", required=True, help="Business category or search phrase")
+    parser.add_argument("--location", required=True, help="Location to search")
+    parser.add_argument("--limit", type=int, default=50, help="Maximum business records")
+    parser.add_argument("--qualification", choices=("qualified", "needs_review", "not_qualified", "mixed"), default="mixed")
+    parser.add_argument("--candidate-limit", type=int, help="Maximum candidates scored before filtering")
+    parser.add_argument("--mode", choices=[item.value for item in ExtractionMode], default="basic")
+    parser.add_argument("--module", action="append", default=[], help="CUSTOM module; repeatable")
+    parser.add_argument("--field", action="append", default=[], help="CUSTOM field; repeatable")
+    parser.add_argument("--headed", action="store_true", help="Show browser windows")
+    parser.add_argument("--verbose", action="store_true", help="Show per-business extraction statuses")
+    parser.add_argument("--output-dir", default="scraper_outputs", help="Output root directory")
+    return parser
+
+async def _run_cli(args: argparse.Namespace) -> None:
+    app = ScraperService(browser_config=BrowserConfig(headless=not args.headed), output_root=args.output_dir, progress=print, verbose=args.verbose)
+    await app.run(args.query, args.location, args.limit, args.mode, custom_modules=args.module, custom_fields=args.field, qualification=args.qualification, candidate_limit=args.candidate_limit)
+
+def main() -> None:
+    asyncio.run(_run_cli(_parser().parse_args()))

@@ -1,11 +1,12 @@
 import asyncio
+import sys
 
 import httpx
 import pytest
 
 from scraper.discovery import BusinessDiscovery, _deduplicate_records
-from scraper.models import BusinessRecord
-from scraper.places import (
+from scraper.discovery import BusinessRecord
+from scraper.discovery import (
     GooglePlacesClient, PlacesApiError, PlacesConfig, PlacesConfigurationError,
     PLACES_FIELD_MASK, PLACES_SEARCH_URL, parse_place,
 )
@@ -169,6 +170,25 @@ def test_missing_api_key_automatically_uses_browser_fallback(monkeypatch):
     assert result[0].fallback_used is True
     assert discovery.diagnostics["fallback_reason"] == "missing_places_api_key"
     assert discovery.diagnostics["source"] == "google_maps_browser"
+
+
+def test_empty_not_implemented_fallback_error_has_playwright_hint(monkeypatch):
+    monkeypatch.delenv("GOOGLE_PLACES_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_MAPS_API_KEY", raising=False)
+
+    class UnsupportedBrowser:
+        async def search(self, *_args):
+            raise NotImplementedError()
+
+    discovery = BusinessDiscovery(
+        places_client=GooglePlacesClient(PlacesConfig(api_key=None)),
+        browser_discovery=UnsupportedBrowser(),
+    )
+    with pytest.raises(NotImplementedError):
+        asyncio.run(discovery.search("clinic", "Nashik", 1))
+    assert "Playwright could not start its browser driver" in discovery.diagnostics["fallback_error"]
+    if sys.platform == "win32":
+        assert "without --reload" in discovery.diagnostics["fallback_error"]
 
 
 def test_connection_timeout_retries_before_success():
