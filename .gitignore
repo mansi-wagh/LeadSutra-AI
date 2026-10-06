@@ -1,0 +1,25 @@
+# Local credentials and environment files
+.env
+.env.*
+!/.env.example
+
+# Python environment and generated caches
+/venv/
+/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+*.py[cod]
+.coverage
+htmlcov/
+
+# Generated run output and logs
+**/scraper_outputs/
+*.log
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
